@@ -2,8 +2,15 @@ mod address;
 mod align;
 mod directory;
 mod encoding;
+#[cfg(feature = "local-kv")]
+#[path = "local.rs"]
+mod rdma;
+#[cfg(not(feature = "local-kv"))]
 mod rdma;
 mod snapshot;
+
+#[cfg(all(feature = "local-kv", feature = "rdma"))]
+compile_error!("local-kv and rdma are mutually exclusive transports");
 #[cfg(test)]
 mod tests;
 pub use address::{DEFAULT_KV_PORT, kv_address};
@@ -403,12 +410,9 @@ impl PeerCache {
         Self::connect(config, plane, redis).await
     }
     async fn connect(config: Config, plane: DataPlane, redis: redis::Client) -> Result<Self> {
+        let transport_version = if cfg!(feature = "local-kv") { "local-v1" } else { "rdma-v4" };
         let scope = digest(
-            format!(
-                "rdma-v4\0{}\0snapshot-v{VERSION}",
-                config.fingerprint
-            )
-            .as_bytes(),
+            format!("{transport_version}\0{}\0snapshot-v{VERSION}", config.fingerprint).as_bytes(),
         );
         let closing = Arc::new(AtomicBool::new(false));
         let (dir, epoch, messages) = tokio::time::timeout(config.timeout, async {

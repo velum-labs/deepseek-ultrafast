@@ -3,6 +3,11 @@ name = "deepseek-ultrafast-engine"
 edition.workspace = true
 version.workspace = true
 
+[features]
+default = []
+local-kv = ["deepseek-ultrafast-kv-transfer/local-kv"]
+rdma = ["deepseek-ultrafast-kv-transfer/rdma"]
+
 [dependencies]
 anyhow.workspace = true
 deepseek-ultrafast-logging = { path = "../logging" }

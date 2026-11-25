@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use deepseek_ultrafast_cuda as cu;
 use deepseek_ultrafast_engine::model::{DecodeSlot, DecodeToken, MAX_PACKED_DECODE_WIDTH, Meta, Rank, SpecDecoded};
 use deepseek_ultrafast_engine::weights::{Arena, Loader};
@@ -230,7 +230,23 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn probe_phase<T>(rk: &mut Rank, phase: &str, run: impl FnOnce(&mut Rank) -> Result<T>) -> Result<T> {
+    let rank = rk.rank;
+    if rank == 0 {
+        eprintln!("kiln_packed_probe_phase phase={phase} status=started");
+    }
+    let output = run(rk).with_context(|| format!("packed probe rank {rank} phase {phase}"))?;
+    if rank == 0 {
+        eprintln!("kiln_packed_probe_phase phase={phase} status=returned");
+    }
+    Ok(output)
+}
+
 fn batch_probe(rk: &mut Rank, prompts: &[Vec<i32>], args: &Args) -> Result<()> {
+    let phase_sync = matches!(std::env::var("DSUF_BATCH_PROBE_SYNC").as_deref(), Ok("1"));
+    if phase_sync {
+        probe_phase(rk, "initial_stream_fence", |rank| rank.synchronize_packed_compute())?;
+    }
     rk.set_packed_target_rows(prompts.len() * (1 + args.packed_drafts))?;
     anyhow::ensure!(prompts.iter().flatten().all(|&token| (0..rk.cfg.vocab_size as i32).contains(&token)), "batch probe prompt token exceeds vocabulary");
     if args.packed_drafts > 0 {
@@ -240,31 +256,39 @@ fn batch_probe(rk: &mut Rank, prompts: &[Vec<i32>], args: &Args) -> Result<()> {
     let mut reference_steps = Vec::with_capacity(prompts.len());
     let mut isolated_elapsed = std::time::Duration::ZERO;
     let verify_rows = args.packed_drafts + 1;
-    let mut reference_slot = rk.new_dense_reference_slot()?;
+    let mut reference_slot = probe_phase(rk, "dense_reference_reserve", |rank| rank.new_dense_reference_slot())?;
     for (sequence, prompt) in prompts.iter().enumerate() {
         let slot = &mut reference_slot;
-        let mut token = probe_prefill(rk, slot, prompt, args, sequence)?;
+        let mut token = probe_phase(rk, &format!("dense_reference_prefill_{sequence}"), |rank| {
+            probe_prefill(rank, slot, prompt, args, sequence, phase_sync)
+        })?;
         first_tokens.push(token);
         let mut emitted = 1;
         let mut steps = Vec::new();
         let start = Instant::now();
         while emitted < args.decode {
             let input = DecodeToken { position: prompt.len() + emitted - 1, token };
-            rk.ensure_decode_slot(slot, input.position + verify_rows)?;
-            let result = probe_decode(rk, &mut [(slot, input)], args.packed_drafts)?.remove(0);
+            let result = probe_phase(rk, &format!("width_one_forward_{sequence}_{}", steps.len()), |rank| {
+                probe_map(rank, slot, input.position + verify_rows, phase_sync)?;
+                Ok(probe_decode(rank, &mut [(slot, input)], args.packed_drafts)?.remove(0))
+            })?;
             token = *result.tokens.last().expect("a decode step emits a token");
             emitted += result.tokens.len();
             steps.push(result);
         }
         isolated_elapsed += start.elapsed();
-        rk.release_decode_slot(slot)?;
+        probe_phase(rk, &format!("dense_reference_release_{sequence}"), |rank| rank.release_decode_slot(slot))?;
         reference_steps.push(steps);
     }
 
     drop(reference_slot);
-    let mut slots = (0..prompts.len()).map(|_| rk.new_decode_slot()).collect::<Result<Vec<_>>>()?;
+    let mut slots = probe_phase(rk, "paged_slots_reserve", |rank| {
+        (0..prompts.len()).map(|_| rank.new_decode_slot()).collect::<Result<Vec<_>>>()
+    })?;
     for (sequence, (prompt, slot)) in prompts.iter().zip(&mut slots).enumerate() {
-        let first = probe_prefill(rk, slot, prompt, args, sequence)?;
+        let first = probe_phase(rk, &format!("paged_prefill_{sequence}"), |rank| {
+            probe_prefill(rank, slot, prompt, args, sequence, phase_sync)
+        })?;
         anyhow::ensure!(first == first_tokens[sequence], "paged prefill diverged from the dense reference at lane {sequence}");
     }
     let mut anchors: Vec<_> = prompts.iter().zip(&first_tokens).map(|(prompt, &token)| DecodeToken {
@@ -284,7 +308,8 @@ fn batch_probe(rk: &mut Rank, prompts: &[Vec<i32>], args: &Args) -> Result<()> {
         for (sequence, slot) in slots.iter_mut().enumerate() {
             if step < reference_steps[sequence].len() {
                 let anchor = anchors[sequence];
-                rk.ensure_decode_slot(slot, anchor.position + verify_rows)?;
+                probe_map(rk, slot, anchor.position + verify_rows, phase_sync)
+                    .with_context(|| format!("packed step {step} sequence {sequence} map"))?;
                 lanes.push((slot, anchor));
                 sequences.push(sequence);
             }
@@ -297,13 +322,15 @@ fn batch_probe(rk: &mut Rank, prompts: &[Vec<i32>], args: &Args) -> Result<()> {
         lanes.rotate_left(rotate);
         sequences.rotate_left(rotate);
         verifier_rows += lanes.len() * verify_rows;
-        let generated = probe_decode(rk, &mut lanes, args.packed_drafts)?;
+        let generated = probe_phase(rk, &format!("packed_forward_step_{step}_width_{}", lanes.len()), |rank| {
+            probe_decode(rank, &mut lanes, args.packed_drafts)
+        })?;
         if step == 0 {
             // Exclude this diagnostic D2H copy from packed decode timing. Step zero is
             // in manifest order and row zero of each lane scores the teacher anchor.
             packed_elapsed += start.elapsed();
             let vocab_shard = rk.cfg.vocab_size / rk.tp;
-            let logits = rk.read_logits(lanes.len() * verify_rows)?;
+            let logits = probe_phase(rk, "packed_anchor_logits", |rank| rank.read_logits(lanes.len() * verify_rows))?;
             anchor_logits = logits.chunks_exact(verify_rows * vocab_shard)
                 .map(|lane| lane[..vocab_shard].to_vec()).collect();
             start = Instant::now();
@@ -319,7 +346,12 @@ fn batch_probe(rk: &mut Rank, prompts: &[Vec<i32>], args: &Args) -> Result<()> {
         }
     }
     packed_elapsed += start.elapsed();
-    for slot in &mut slots { rk.release_decode_slot(slot)?; }
+    probe_phase(rk, "packed_slots_release", |rank| {
+        for slot in &mut slots {
+            rank.release_decode_slot(slot)?;
+        }
+        Ok(())
+    })?;
     if rk.rank == 0 {
         println!("packed target graph ready = {}", rk.packed_target_graph_ready(args.packed_drafts > 0));
         println!("packed width {}, {} drafts: {emitted} emitted tokens in {step_count} launches and {verifier_rows} verifier rows, 0 token mismatches, {:.2} useful tokens/launch, {:.2} accepted drafts per sequence step, {:.1} isolated tokens/s, {:.1} packed tokens/s",
@@ -327,7 +359,9 @@ fn batch_probe(rk: &mut Rank, prompts: &[Vec<i32>], args: &Args) -> Result<()> {
             emitted as f64 / isolated_elapsed.as_secs_f64(), emitted as f64 / packed_elapsed.as_secs_f64());
     }
     drop(slots);
-    compare_incumbent_logits(rk, args, prompts, &first_tokens, &anchor_logits)
+    probe_phase(rk, "incumbent_logit_comparison", |rank| {
+        compare_incumbent_logits(rank, args, prompts, &first_tokens, &anchor_logits, phase_sync)
+    })
 }
 
 fn compare_incumbent_logits(
@@ -336,22 +370,26 @@ fn compare_incumbent_logits(
     prompts: &[Vec<i32>],
     anchors: &[i32],
     packed_logits: &[Vec<f32>],
+    phase_sync: bool,
 ) -> Result<()> {
     anyhow::ensure!(prompts.len() == anchors.len() && anchors.len() == packed_logits.len());
     let mut dense_slot = rk.new_dense_reference_slot()?;
     let (mut max_abs, mut squared, mut count, mut nonfinite) = (0f64, 0f64, 0usize, 0usize);
     let mut worst = (0usize, 0usize);
     for (sequence, ((prompt, &anchor), packed)) in prompts.iter().zip(anchors).zip(packed_logits).enumerate() {
-        probe_prefill(rk, &mut dense_slot, prompt, args, sequence)?;
-        rk.ensure_decode_slot(&mut dense_slot, prompt.len() + 1)?;
+        probe_prefill(rk, &mut dense_slot, prompt, args, sequence, phase_sync)
+            .with_context(|| format!("incumbent prefill sequence {sequence}"))?;
+        probe_map(rk, &mut dense_slot, prompt.len() + 1, phase_sync)
+            .with_context(|| format!("incumbent anchor map sequence {sequence}"))?;
         let dense = rk.with_decode_slot(&mut dense_slot, |rank| {
             let mut meta = Meta { pos: prompt.len() as i32, m: 1, ..Default::default() };
             meta.tokens[0] = anchor;
             rank.set_meta(&meta)?;
             rank.forward(1, rank.cfg.n_layers, None)?;
             rank.read_logits(1)
-        })?;
-        rk.release_decode_slot(&mut dense_slot)?;
+        }).with_context(|| format!("incumbent anchor forward sequence {sequence}"))?;
+        rk.release_decode_slot(&mut dense_slot)
+            .with_context(|| format!("incumbent release sequence {sequence}"))?;
         anyhow::ensure!(dense.len() == packed.len(), "teacher-forced vocabulary shard differs");
         for (id, (&reference, &candidate)) in dense.iter().zip(packed).enumerate() {
             let error = (f64::from(reference) - f64::from(candidate)).abs();
@@ -373,9 +411,26 @@ fn compare_incumbent_logits(
     Ok(())
 }
 
-fn probe_prefill(rk: &mut Rank, slot: &mut DecodeSlot, prompt: &[i32], args: &Args, sequence: usize) -> Result<i32> {
+fn probe_map(rk: &mut Rank, slot: &mut DecodeSlot, through: usize, phase_sync: bool) -> Result<()> {
+    rk.ensure_decode_slot(slot, through)
+        .with_context(|| format!("map probe slot through {through} tokens"))?;
+    if phase_sync {
+        rk.synchronize_packed_compute()
+            .with_context(|| format!("map probe slot stream fence through {through} tokens"))?;
+    }
+    Ok(())
+}
+
+fn probe_prefill(
+    rk: &mut Rank,
+    slot: &mut DecodeSlot,
+    prompt: &[i32],
+    args: &Args,
+    sequence: usize,
+    phase_sync: bool,
+) -> Result<i32> {
     let seed = args.seed.wrapping_add(sequence as u64);
-    rk.ensure_decode_slot(slot, prompt.len())?;
+    probe_map(rk, slot, prompt.len(), phase_sync)?;
     rk.with_decode_slot(slot, |rank| {
         rank.set_sampling(seed)?;
         rank.prefill(prompt, 0, args.chunk)

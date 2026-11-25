@@ -330,7 +330,7 @@ impl<'a> Worker<'a> {
             let first = prefill_from(&mut rk, chunk, &[0], 0)?;
             rk.spec_begin(first, 1)?;
             rk.set_sampling(0)?;
-            Some(rk.capture_spec()?)
+            Some(rk.capture_spec_blk(rk.cfg.dspark_block_size)?)
         };
         let restore = kvstore::RestoreSlot::new()?;
         Ok(Worker { publisher: None, rk, r, chunk, shared, graph, restore, cached: vec![], decisions: 0 })

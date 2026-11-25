@@ -278,23 +278,15 @@ extern "C" __global__ void __launch_bounds__(1024) topk_select(const Meta* meta,
     topk_select_row(p, m, n);
 }
 
-DEV void compress_pool_body(const Meta* meta, const PackedRow* rows, int layer, const float* kvh,
+extern "C" __global__ void __launch_bounds__(128) compress_pool(const Meta* meta, const float* kvh,
                                                                const float* sch, int ratio, const bf16* w, float eps,
-                                                               bf16* latent, int dim, int ring_rows) {
+                                                               bf16* latent, int dim) {
     __shared__ float sh[4];
     __shared__ bf16 tmp[512];
     constexpr int RMAX = 4, DPT = 4;
     const int m = blockIdx.x;
-    if (rows && !rows[m].meta) return;
-    const int pos = rows ? rows[m].position : meta->pos + m;
-    const int pos0 = rows ? pos - rows[m].local : meta->pos;
-    const bool act = (rows || m < meta->m) && (pos + 1) % ratio == 0;
-    if (rows) {
-        const PackedLayer cache = rows[m].layers[layer];
-        kvh = cache.kv_history;
-        sch = cache.score_history;
-        ring_rows = cache.history_rows;
-    }
+    const int pos0 = meta->pos, pos = pos0 + m;
+    const bool act = m < meta->m && (pos + 1) % ratio == 0;
     const int g0 = pos + 1 - ratio;
     float sv[DPT][RMAX], kv[DPT][RMAX], wv[DPT];
 #pragma unroll
@@ -304,8 +296,8 @@ DEV void compress_pool_body(const Meta* meta, const PackedRow* rows, int layer, 
 #pragma unroll
         for (int i = 0; i < RMAX; ++i) {
             const bool on = act && d < dim && i < ratio && g0 + i < pos0;
-            sv[k][i] = on ? sch[(size_t)cache_row(g0 + i, ring_rows) * dim + d] : -INFINITY;
-            kv[k][i] = on ? kvh[(size_t)cache_row(g0 + i, ring_rows) * dim + d] : 0.f;
+            sv[k][i] = on ? sch[(size_t)(g0 + i) * dim + d] : -INFINITY;
+            kv[k][i] = on ? kvh[(size_t)(g0 + i) * dim + d] : 0.f;
         }
     }
     pdl_wait();
@@ -317,8 +309,8 @@ DEV void compress_pool_body(const Meta* meta, const PackedRow* rows, int layer, 
         for (int i = 0; i < RMAX; ++i) {
             const int d = threadIdx.x + k * 128;
             if (d < dim && i < ratio && g0 + i >= pos0) {
-                sv[k][i] = sch[(size_t)cache_row(g0 + i, ring_rows) * dim + d];
-                kv[k][i] = kvh[(size_t)cache_row(g0 + i, ring_rows) * dim + d];
+                sv[k][i] = sch[(size_t)(g0 + i) * dim + d];
+                kv[k][i] = kvh[(size_t)(g0 + i) * dim + d];
             }
         }
     float ss = 0.f;
@@ -354,13 +346,80 @@ DEV void compress_pool_body(const Meta* meta, const PackedRow* rows, int layer, 
     }
 }
 
-extern "C" __global__ void __launch_bounds__(128) compress_pool(const Meta* meta, const float* kvh, const float* sch,
-    int ratio, const bf16* w, float eps, bf16* latent, int dim, int ring_rows) {
-    compress_pool_body(meta, nullptr, 0, kvh, sch, ratio, w, eps, latent, dim, ring_rows);
+// The ring and packed paths read GPU-produced descriptors. Wait before
+// resolving either a logical group or the cache addresses that hold it.
+DEV void compress_pool_ring_body(int m, int pos, const float* kvh, const float* sch, int ring_rows,
+                                 int ratio, const bf16* w, float eps, bf16* latent, int dim) {
+    __shared__ float sh[4];
+    __shared__ bf16 tmp[512];
+    constexpr int RMAX = 4, DPT = 4;
+    if (pos < ratio - 1 || (pos + 1) % ratio != 0) return;
+    const int g0 = pos + 1 - ratio;
+    float sv[DPT][RMAX], kv[DPT][RMAX], wv[DPT];
+#pragma unroll
+    for (int k = 0; k < DPT; ++k) {
+        const int d = threadIdx.x + k * 128;
+        wv[k] = d < dim ? bf(w[d]) : 0.f;
+#pragma unroll
+        for (int i = 0; i < RMAX; ++i) {
+            const bool active = d < dim && i < ratio;
+            const size_t index = (size_t)cache_row(g0 + i, ring_rows) * dim + d;
+            sv[k][i] = active ? sch[index] : -INFINITY;
+            kv[k][i] = active ? kvh[index] : 0.f;
+        }
+    }
+    float ss = 0.f;
+#pragma unroll
+    for (int k = 0; k < DPT; ++k) {
+        const int d = threadIdx.x + k * 128;
+        if (d < dim) {
+            float mx = -INFINITY;
+#pragma unroll
+            for (int i = 0; i < RMAX; ++i)
+                if (i < ratio) mx = fmaxf(mx, sv[k][i]);
+            float den = 0.f, num = 0.f;
+#pragma unroll
+            for (int i = 0; i < RMAX; ++i)
+                if (i < ratio) den += expf(sv[k][i] - mx);
+#pragma unroll
+            for (int i = 0; i < RMAX; ++i)
+                if (i < ratio) num += kv[k][i] * (expf(sv[k][i] - mx) / den);
+            const bf16 b = tobf(num);
+            tmp[d] = b;
+            ss += bf(b) * bf(b);
+        }
+    }
+    ss = warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    ss = sh[0] + sh[1] + sh[2] + sh[3];
+    const float r = rsqrtf(ss / dim + eps);
+#pragma unroll
+    for (int k = 0; k < DPT; ++k) {
+        const int d = threadIdx.x + k * 128;
+        if (d < dim) latent[(size_t)m * dim + d] = tobf(wv[k] * (bf(tmp[d]) * r));
+    }
 }
+
+extern "C" __global__ void __launch_bounds__(128) compress_pool_ring(const Meta* meta, const float* kvh,
+    const float* sch, int ratio, const bf16* w, float eps, bf16* latent, int dim, int ring_rows) {
+    pdl_wait();
+    pdl_launch();
+    const int m = blockIdx.x;
+    if (m >= meta->m) return;
+    compress_pool_ring_body(m, meta->pos + m, kvh, sch, ring_rows, ratio, w, eps, latent, dim);
+}
+
 extern "C" __global__ void __launch_bounds__(128) packed_compress_pool(const PackedRow* rows, int layer,
     int ratio, const bf16* w, float eps, bf16* latent, int dim) {
-    compress_pool_body(nullptr, rows, layer, nullptr, nullptr, ratio, w, eps, latent, dim, 0);
+    pdl_wait();
+    pdl_launch();
+    const int m = blockIdx.x;
+    const PackedRow row = rows[m];
+    if (!row.meta) return;
+    const PackedLayer cache = row.layers[layer];
+    compress_pool_ring_body(m, row.position, cache.kv_history, cache.score_history, cache.history_rows,
+                            ratio, w, eps, latent, dim);
 }
 
 extern "C" __global__ void packed_store_hist(const PackedRow* rows, int layer,
@@ -643,9 +702,10 @@ extern "C" __global__ void __launch_bounds__(128) attn_fused(const Meta* meta, c
 extern "C" __global__ void __launch_bounds__(128) attn_fused_hg(const Meta* meta, const __grid_constant__ AttnFParams p) { attn_fused_body(meta, blockIdx.y, p); }
 extern "C" __global__ void __launch_bounds__(128) attn_packed(
     const PackedRow* rows, int layer, const __grid_constant__ AttnFParams common) {
+    // Packed row descriptors are produced by an earlier PDL-enabled launch.
+    pdl_wait();
     const PackedRow row = rows[blockIdx.y];
     if (!row.meta) {
-        pdl_wait();
         pdl_launch();
         if (blockIdx.x == 0) {
             const int first_head = blockIdx.z * AH;

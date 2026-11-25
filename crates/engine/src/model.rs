@@ -1,7 +1,7 @@
 use crate::ops::{self, Epilogue, GemvOpts, Moe, RopeParams, WFmt, Weight};
 use crate::sampling::{SampIo, SampParams};
 use crate::weights::{Arena, Layer, Weights};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use deepseek_ultrafast_cuda::{self as cu, Args, DevPtr, Launch, Stream};
 use deepseek_ultrafast_kernels::Kernels;
 use deepseek_ultrafast_model::config::{Config, rope_table};
@@ -598,6 +598,8 @@ pub struct Rank {
     packed_rows: DevPtr,
     packed_target_rows: usize,
     packed_graphs_enabled: bool,
+    batch_probe_sync: bool,
+    batch_probe_layer_sync: bool,
     packed_graphs: std::collections::HashMap<(usize, bool), Option<cu::GraphExec>>,
     packed_spec: Option<batch_speculation::Workspace>,
     mk_kmax: DevPtr,
@@ -759,6 +761,9 @@ impl Rank {
                 _ => anyhow::bail!("DSUF_PACKED_GRAPHS must be 0 or 1"),
             }
         } else { false };
+        let batch_probe_sync = matches!(std::env::var("DSUF_BATCH_PROBE_SYNC").as_deref(), Ok("1"));
+        let batch_probe_layer_sync = batch_probe_sync
+            && matches!(std::env::var("DSUF_BATCH_PROBE_LAYER_SYNC").as_deref(), Ok("1"));
         let (plo, phi) = Stream::priority_range()?;
         let (pmain, pside, ppar) = match deepseek_ultrafast_cuda::profile::profile() {
             deepseek_ultrafast_cuda::profile::Profile::Sm103Tp4 => (-4, -4, -5),
@@ -1142,6 +1147,8 @@ impl Rank {
             packed_rows,
             packed_target_rows: if packed { 8 } else { 0 },
             packed_graphs_enabled,
+            batch_probe_sync,
+            batch_probe_layer_sync,
             packed_graphs: Default::default(),
             packed_spec: None,
             mk_kmax,
@@ -2351,6 +2358,23 @@ impl Rank {
         [(self.tail.h, self.cfg.window_size * 4 * self.cfg.dim * 2), (self.tail.pre, self.cfg.window_size * 4 * 4)]
     }
 
+    fn batch_probe_fence(&self, phase: &str, layer: Option<usize>) -> Result<()> {
+        if !self.batch_probe_sync {
+            return Ok(());
+        }
+        let pos = self.host_pos_end;
+        let rows = self.cur_m;
+        if self.rank == 0 {
+            eprintln!("kiln_packed_probe_fence phase={phase} layer={layer:?} end={pos} rows={rows} status=started");
+        }
+        self.synchronize_packed_compute()
+            .with_context(|| format!("packed probe rank {} fence after {phase}, layer {layer:?}, end {pos}, rows {rows}", self.rank))?;
+        if self.rank == 0 {
+            eprintln!("kiln_packed_probe_fence phase={phase} layer={layer:?} end={pos} rows={rows} status=passed");
+        }
+        Ok(())
+    }
+
     fn replay_decoder(&mut self, toks: &[i32]) -> Result<i32> {
         let c = self.cfg.clone();
         let n = toks.len();
@@ -2383,11 +2407,13 @@ impl Rank {
         self.win_floor.set(0);
         self.swa_replay.set(false);
         r?;
+        self.batch_probe_fence("decoder_replay_and_head", None)?;
         if m > MAX_M {
             self.dspark_prep_tail(m, 0)?;
         } else {
             self.dspark_prep(m)?;
         }
+        self.batch_probe_fence("draft_kv_prep", None)?;
         let next = self.read_next(m)?;
         Ok(next[m - 1])
     }
@@ -2488,8 +2514,11 @@ impl Rank {
                 rk.set_meta(&meta)?;
             }
             rk.forward_impl(m, 0, progress.decoder_start, true, false, None, None)?;
+            rk.batch_probe_fence("encoder_prefill", None)?;
             rk.stream_kv_source(progress.decoder_start, m)?;
-            rk.stash_tail(m)
+            rk.batch_probe_fence("encoder_kv_source", Some(progress.decoder_start))?;
+            rk.stash_tail(m)?;
+            rk.batch_probe_fence("encoder_stash_tail", None)
         })?;
         progress.pos += m;
         self.end_prefill();
@@ -2758,6 +2787,10 @@ impl Rank {
             }
             if l + 1 == hi && self.cand_pending.replace(false) {
                 self.par_join()?;
+            }
+            if self.batch_probe_layer_sync {
+                let phase = if self.swa_replay.get() { "replay_layer" } else { "forward_layer" };
+                self.batch_probe_fence(phase, Some(l))?;
             }
             if let Some(t) = trace.as_deref_mut() {
                 t.push(self.read_h(m)?);
@@ -3675,11 +3708,16 @@ impl Rank {
                             )?;
                         }
                     }
-                    self.launch(
-                        "compress_pool",
-                        Launch::new(m as u32, 128),
-                        Args::new().ptr(self.meta).ptr(kvh).ptr(sch).i32(ratio as i32).ptr(cp.norm).f32(c.norm_eps).ptr(self.b.latent).i32(hd as i32).i32(ring_rows),
-                    )?;
+                    let mut args = Args::new();
+                    args.ptr(self.meta).ptr(kvh).ptr(sch).i32(ratio as i32).ptr(cp.norm)
+                        .f32(c.norm_eps).ptr(self.b.latent).i32(hd as i32);
+                    let kernel = if ring_rows == 0 {
+                        "compress_pool"
+                    } else {
+                        args.i32(ring_rows);
+                        "compress_pool_ring"
+                    };
+                    self.launch(kernel, Launch::new(m as u32, 128), &mut args)?;
                 } else {
                     self.gemv(&cp.wkv, x, dim, m, self.b.latent, hd, xa)?;
                 }

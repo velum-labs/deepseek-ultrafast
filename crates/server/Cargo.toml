@@ -4,8 +4,10 @@ edition.workspace = true
 version.workspace = true
 
 [features]
-default = ["gpu"]
+default = ["gpu", "rdma"]
 gpu = ["dep:deepseek-ultrafast-cuda", "dep:deepseek-ultrafast-engine", "dep:deepseek-ultrafast-kv-transfer"]
+rdma = ["gpu", "deepseek-ultrafast-kv-transfer/rdma", "deepseek-ultrafast-engine/rdma"]
+local-kv = ["gpu", "deepseek-ultrafast-kv-transfer/local-kv", "deepseek-ultrafast-engine/local-kv"]
 
 [[bin]]
 name = "serve"
@@ -20,7 +22,7 @@ axum = "0.8"
 deepseek-ultrafast-cuda = { path = "../cuda", optional = true }
 deepseek-ultrafast-engine = { path = "../engine", optional = true }
 deepseek-ultrafast-model = { path = "../model" }
-deepseek-ultrafast-kv-transfer = { path = "../kv-transfer", optional = true }
+deepseek-ultrafast-kv-transfer = { path = "../kv-transfer", optional = true, default-features = false }
 deepseek-recipe = { git = "https://github.com/deepseek-ai/deepseek-recipe", rev = "8cadfede7063c896b944e7bae05daa3549ae97ea" }
 deepseek-recipe-core = { git = "https://github.com/deepseek-ai/deepseek-recipe", rev = "8cadfede7063c896b944e7bae05daa3549ae97ea" }
 deepseek-recipe-encoding = { git = "https://github.com/deepseek-ai/deepseek-recipe", rev = "8cadfede7063c896b944e7bae05daa3549ae97ea" }

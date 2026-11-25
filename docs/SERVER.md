@@ -24,6 +24,19 @@ cargo build --release -p deepseek-ultrafast-server
 target/release/serve --ckpt /path/to/models --gpus 0,1,2,3,4,5,6,7 --port 8000 [--max-seq 1048576] [--chunk 8192] [--model-name deepseek-v4.1-flash]
 ```
 
+The default build keeps the RDMA transport. For a single-host deployment with no
+peer transfer, build the local KV backend explicitly:
+
+```sh
+cargo build --release -p deepseek-ultrafast-server --no-default-features --features local-kv
+```
+
+`local-kv` retains Redis-backed cache ownership and local KV reuse, binds its Velo
+listener to loopback, and refuses remote peer transfers. The `rdma` and `local-kv`
+features are mutually exclusive. Standalone engine probes use
+`cargo build --release -p deepseek-ultrafast-engine --no-default-features --features local-kv --bin run`
+to exercise the same transport as the server.
+
 The server is ready when `/readyz` returns 200 and the JSON `health_ready` event is
 emitted. Weights load from safetensors through the default-on parallel loader; startup
 uses bounded pinned staging with a pageable fallback.
